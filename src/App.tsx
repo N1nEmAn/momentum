@@ -1,19 +1,43 @@
 import React, { useState, useEffect } from 'react';
-import { AppState, Chain, ScheduledSession, ActiveSession, CompletionHistory } from './types';
+import { AppState, Chain, ScheduledSession, ActiveSession, CompletionHistory, RSIPNode, RSIPMeta } from './types';
 import { Dashboard } from './components/Dashboard';
+import { RSIPView } from './components/RSIPView';
 import { AuthWrapper } from './components/AuthWrapper';
 import { ChainEditor } from './components/ChainEditor';
 import { FocusMode } from './components/FocusMode';
 import { ChainDetail } from './components/ChainDetail';
 import { GroupView } from './components/GroupView';
+import { TaskGroupEditor } from './components/TaskGroupEditor';
 import { AuxiliaryJudgment } from './components/AuxiliaryJudgment';
+import { BettingModal } from './components/BettingModal';
+import { UserSettingsService } from './services/UserSettingsService';
+import { BetPlacementResult } from './services/BettingService';
+import { SessionService } from './services/SessionService';
 import { storage as localStorageUtils } from './utils/storage';
 import { supabaseStorage } from './utils/supabaseStorage';
-import { getCurrentUser, isSupabaseConfigured } from './lib/supabase';
+import { isSupabaseConfigured, isUserAuthenticated, waitForAuthentication } from './lib/supabase';
 import { isSessionExpired } from './utils/time';
-import { buildChainTree, getNextUnitInGroup, updateGroupCompletions } from './utils/chainTree';
+import { buildChainTree, getNextUnitInGroup, updateGroupCompletions, isGroupFullyCompleted, incrementGroupCompletionCount, resetGroupCompletionCount } from './utils/chainTree';
+import { queryOptimizer } from './utils/queryOptimizer';
 import { notificationManager } from './utils/notifications';
+import { performanceDashboard } from './utils/performanceDashboard';
 import { startGroupTimer, isGroupExpired, resetGroupProgress } from './utils/timeLimit';
+import { forwardTimerManager } from './utils/forwardTimer';
+import { initializeRuleSystem } from './utils/initializeRuleSystem';
+import { runMigration } from './utils/migration';
+import { realTimeSyncService } from './services/RealTimeSyncService';
+import { soundManager } from './utils/soundManager';
+
+// ENHANCED: Import restore function tester for development debugging
+if (process.env.NODE_ENV === 'development') {
+  import('./utils/restoreFunctionTester').then(({ restoreFunctionTester }) => {
+    // Make tester available globally for debugging
+    (window as any).__restoreTester = restoreFunctionTester;
+    console.log('🔧 Restore function tester loaded - use window.__restoreTester to test restore functionality');
+  }).catch(error => {
+    console.warn('Failed to load restore function tester:', error);
+  });
+}
 
 function App() {
   const [state, setState] = useState<AppState>({
@@ -24,18 +48,48 @@ function App() {
     editingChain: null,
     viewingChainId: null,
     completionHistory: [],
+    rsipNodes: [],
+    rsipMeta: {},
+    taskTimeStats: [],
   });
 
   const [showAuxiliaryJudgment, setShowAuxiliaryJudgment] = useState<string | null>(null);
   const [isInitialized, setIsInitialized] = useState(false);
   const [isLoadingData, setIsLoadingData] = useState(true);
+  const [recycleBinRefreshTrigger, setRecycleBinRefreshTrigger] = useState<number>(0);
+
+  // 押注相关状态
+  const [showBettingModal, setShowBettingModal] = useState(false);
+  const [pendingChainId, setPendingChainId] = useState<string | null>(null);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null); // 跟踪数据库中的活动session UUID
 
   // Determine storage source immediately based on Supabase configuration
   const storage = isSupabaseConfigured ? supabaseStorage : localStorageUtils;
   
   useEffect(() => {
-    console.log('存储源确定:', isSupabaseConfigured ? 'Supabase' : 'LocalStorage');
+    // Storage source determined based on Supabase configuration
+    
+    // 初始化规则系统
+    initializeRuleSystem().then(result => {
+      if (!result.success) {
+        console.error('Rule system initialization failed:', result.message);
+      }
+    }).catch(error => {
+      console.error('Rule system initialization error:', error);
+    });
+
+    // 运行迁移脚本
+    runMigration();
+    
     setIsInitialized(true);
+    
+    // Initialize performance monitoring for development
+    if (process.env.NODE_ENV === 'development') {
+      setTimeout(() => {
+        performanceDashboard.displayConsoleReport();
+      }, 5000);
+    }
   }, []);
 
   const renderContent = () => {
@@ -86,7 +140,7 @@ function App() {
             {showAuxiliaryJudgment && (
               <AuxiliaryJudgment
                 chain={state.chains.find(c => c.id === showAuxiliaryJudgment)!}
-                onJudgmentFailure={(reason) => handleAuxiliaryJudgmentFailure(showAuxiliaryJudgment, reason)}
+                onJudgmentFailure={() => handleAuxiliaryJudgmentFailure(showAuxiliaryJudgment!)}
                 onJudgmentAllow={(exceptionRule) => handleAuxiliaryJudgmentAllow(showAuxiliaryJudgment, exceptionRule)}
                 onCancel={() => setShowAuxiliaryJudgment(null)}
               />
@@ -94,7 +148,20 @@ function App() {
           </>
         );
 
-      case 'focus':
+      case 'taskgroup-editor':
+        return (
+          <>
+            <TaskGroupEditor
+              chain={state.editingChain || undefined}
+              isEditing={!!state.editingChain}
+              initialParentId={state.viewingChainId || undefined}
+              onSave={handleSaveChain}
+              onCancel={handleBackToDashboard}
+            />
+          </>
+        );
+
+      case 'focus': {
         const activeChain = state.chains.find(c => c.id === state.activeSession?.chainId);
         if (!state.activeSession || !activeChain) {
           handleBackToDashboard();
@@ -105,6 +172,7 @@ function App() {
             <FocusMode
               session={state.activeSession}
               chain={activeChain}
+              storage={storage}
               onComplete={handleCompleteSession}
               onInterrupt={handleInterruptSession}
               onAddException={handleAddException}
@@ -114,15 +182,16 @@ function App() {
             {showAuxiliaryJudgment && (
               <AuxiliaryJudgment
                 chain={state.chains.find(c => c.id === showAuxiliaryJudgment)!}
-                onJudgmentFailure={(reason) => handleAuxiliaryJudgmentFailure(showAuxiliaryJudgment, reason)}
+                onJudgmentFailure={() => handleAuxiliaryJudgmentFailure(showAuxiliaryJudgment!)}
                 onJudgmentAllow={(exceptionRule) => handleAuxiliaryJudgmentAllow(showAuxiliaryJudgment, exceptionRule)}
                 onCancel={() => setShowAuxiliaryJudgment(null)}
               />
             )}
           </>
         );
+      }
 
-      case 'detail':
+      case 'detail': {
         const viewingChain = state.chains.find(c => c.id === state.viewingChainId);
         if (!viewingChain) {
           handleBackToDashboard();
@@ -140,15 +209,16 @@ function App() {
             {showAuxiliaryJudgment && (
               <AuxiliaryJudgment
                 chain={state.chains.find(c => c.id === showAuxiliaryJudgment)!}
-                onJudgmentFailure={(reason) => handleAuxiliaryJudgmentFailure(showAuxiliaryJudgment, reason)}
+                onJudgmentFailure={() => handleAuxiliaryJudgmentFailure(showAuxiliaryJudgment!)}
                 onJudgmentAllow={(exceptionRule) => handleAuxiliaryJudgmentAllow(showAuxiliaryJudgment, exceptionRule)}
                 onCancel={() => setShowAuxiliaryJudgment(null)}
               />
             )}
           </>
         );
+      }
 
-      case 'group':
+      case 'group': {
         const viewingGroup = state.chains.find(c => c.id === state.viewingChainId);
         if (!viewingGroup) {
           handleBackToDashboard();
@@ -156,7 +226,7 @@ function App() {
         }
         
         // 构建任务树并找到对应的群组节点
-        const chainTree = buildChainTree(state.chains);
+        const chainTree = queryOptimizer.memoizedBuildChainTree(state.chains);
         const groupNode = chainTree.find(node => node.id === state.viewingChainId);
         if (!groupNode) {
           handleBackToDashboard();
@@ -172,20 +242,60 @@ function App() {
               onBack={handleBackToDashboard}
               onStartChain={handleStartChain}
               onScheduleChain={handleScheduleChain}
+              onViewDetail={handleViewChainDetail}
               onEditChain={(chainId) => handleEditChain(chainId)}
               onDeleteChain={handleDeleteChain}
               onAddUnit={() => handleCreateChain(state.viewingChainId!)}
              onImportUnits={handleImportUnits}
+              onUpdateTaskRepeatCount={handleUpdateTaskRepeatCount}
+              onReorderUnit={async (groupId, unitId, direction) => {
+                // 计算相邻项并交换 sortOrder
+                const chainTree = queryOptimizer.memoizedBuildChainTree(state.chains);
+                const groupNode = chainTree.find(n => n.id === groupId);
+                if (!groupNode) return;
+                const idx = groupNode.children.findIndex(c => c.id === unitId);
+                if (idx < 0) return;
+                const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
+                if (targetIdx < 0 || targetIdx >= groupNode.children.length) return;
+                const a = groupNode.children[idx];
+                const b = groupNode.children[targetIdx];
+                const updated = state.chains.map(ch => {
+                  if (ch.id === a.id) return { ...ch, sortOrder: b.sortOrder };
+                  if (ch.id === b.id) return { ...ch, sortOrder: a.sortOrder };
+                  return ch;
+                });
+                await safelySaveChains(updated);
+                queryOptimizer.onDataChange('chains');
+                setState(prev => ({ ...prev, chains: updated }));
+              }}
             />
             {showAuxiliaryJudgment && (
               <AuxiliaryJudgment
                 chain={state.chains.find(c => c.id === showAuxiliaryJudgment)!}
-                onJudgmentFailure={(reason) => handleAuxiliaryJudgmentFailure(showAuxiliaryJudgment, reason)}
+                onJudgmentFailure={() => handleAuxiliaryJudgmentFailure(showAuxiliaryJudgment!)}
                 onJudgmentAllow={(exceptionRule) => handleAuxiliaryJudgmentAllow(showAuxiliaryJudgment, exceptionRule)}
                 onCancel={() => setShowAuxiliaryJudgment(null)}
               />
             )}
           </>
+        );
+      }
+
+      case 'rsip':
+        return (
+          <RSIPView
+            nodes={state.rsipNodes}
+            meta={state.rsipMeta}
+            onBack={handleBackToDashboard}
+            onSaveNodes={async (nodes) => {
+              await storage.saveRSIPNodes(nodes);
+              setState(prev => ({ ...prev, rsipNodes: nodes }));
+            }}
+            onSaveMeta={async (meta) => {
+              await storage.saveRSIPMeta(meta);
+              setState(prev => ({ ...prev, rsipMeta: meta }));
+            }}
+          />
         );
 
       default:
@@ -196,17 +306,26 @@ function App() {
               scheduledSessions={state.scheduledSessions}
               isLoading={isLoadingData}
               onCreateChain={handleCreateChain}
+              onCreateTaskGroup={handleCreateTaskGroup}
+              onOpenRSIP={() => setState(prev => ({ ...prev, currentView: 'rsip' }))}
               onStartChain={handleStartChain}
               onScheduleChain={handleScheduleChain}
               onViewChainDetail={handleViewChainDetail}
               onCancelScheduledSession={handleCancelScheduledSession}
+              onCompleteBooking={handleCompleteBooking}
               onDeleteChain={handleDeleteChain}
               onImportChains={handleImportChains}
+              onRestoreChains={handleRestoreChains}
+              onPermanentDeleteChains={handlePermanentDeleteChains}
+              history={state.completionHistory}
+              rsipNodes={state.rsipNodes}
+              rsipMeta={state.rsipMeta}
+              recycleBinRefreshTrigger={recycleBinRefreshTrigger}
             />
             {showAuxiliaryJudgment && (
               <AuxiliaryJudgment
                 chain={state.chains.find(c => c.id === showAuxiliaryJudgment)!}
-                onJudgmentFailure={(reason) => handleAuxiliaryJudgmentFailure(showAuxiliaryJudgment, reason)}
+                onJudgmentFailure={() => handleAuxiliaryJudgmentFailure(showAuxiliaryJudgment!)}
                 onJudgmentAllow={(exceptionRule) => handleAuxiliaryJudgmentAllow(showAuxiliaryJudgment, exceptionRule)}
                 onCancel={() => setShowAuxiliaryJudgment(null)}
               />
@@ -219,18 +338,27 @@ function App() {
   // Load data from storage on mount
   useEffect(() => {
     const loadData = async () => {
-      console.log('开始加载数据，使用存储类型:', isSupabaseConfigured ? 'Supabase' : 'LocalStorage');
+      console.log('Starting data load, using storage type:', isSupabaseConfigured ? 'Supabase' : 'LocalStorage');
       setIsLoadingData(true);
       try {
-        const chains = await storage.getChains();
+        // 在加载数据前先执行自动清理
+        try {
+          const cleanedCount = await storage.cleanupExpiredDeletedChains(30);
+          if (cleanedCount > 0) {
+            console.log(`Auto-cleaned ${cleanedCount} expired deleted chains`);
+          }
+        } catch (cleanupError) {
+          console.error('Auto cleanup failed:', cleanupError);
+        }
+        const chains = await storage.getActiveChains();
         
         // 检查并修复循环引用的数据
         const hasCircularReferences = chains.some(chain => chain.parentId === chain.id);
         if (hasCircularReferences) {
-          console.log('检测到循环引用数据，正在修复...');
+          console.log('Detected circular reference data, fixing...');
           const fixedChains = chains.map(chain => {
             if (chain.parentId === chain.id) {
-              console.log(`修复链条 ${chain.name} 的循环引用`);
+              console.log(`Fixed circular reference for chain ${chain.name}`);
               return { ...chain, parentId: undefined };
             }
             return chain;
@@ -238,7 +366,7 @@ function App() {
           
           // 将修复后的数据保存回数据库
           await storage.saveChains(fixedChains);
-          console.log('循环引用数据修复完成并已保存');
+          console.log('Circular reference data fix completed and saved');
           
           // 使用修复后的数据
           setState(prev => ({
@@ -252,22 +380,46 @@ function App() {
           return;
         }
         
-        console.log('加载到的链数据:', chains.length, '条');
-        console.log('链数据详情:', chains.map(c => ({ id: c.id, name: c.name })));
+        console.log('Loaded chain data:', chains.length, 'items');
+        console.log('Chain data details:', chains.map(c => ({ id: c.id, name: c.name })));
         const allScheduledSessions = await storage.getScheduledSessions();
         const scheduledSessions = allScheduledSessions.filter(
           session => !isSessionExpired(session.expiresAt)
         );
         const activeSession = await storage.getActiveSession();
         const completionHistory = await storage.getCompletionHistory();
+        const rsipNodes = await storage.getRSIPNodes();
+        const rsipMeta = await storage.getRSIPMeta();
+        const taskTimeStats = await storage.getTaskTimeStats();
 
-        console.log('设置应用状态，链数量:', chains.length);
+        // 执行数据迁移以确保历史记录包含用时信息
+        storage.migrateCompletionHistoryForTiming();
+        
+        // 执行完整的数据迁移（仅在开发环境中记录详细信息）
+        if (process.env.NODE_ENV === 'development') {
+          try {
+            const { dataMigrationManager } = await import('./utils/dataMigration');
+            const migrationResult = await dataMigrationManager.migrateAll();
+            if (!migrationResult.success || migrationResult.errors.length > 0) {
+              console.warn('Data migration completed with warnings:', migrationResult);
+            } else {
+              console.log('Data migration completed successfully');
+            }
+          } catch (migrationError) {
+            console.warn('Error occurred during data migration:', migrationError);
+          }
+        }
+
+        console.log('Setting app state, chain count:', chains.length);
         setState(prev => ({
           ...prev,
           chains,
           scheduledSessions,
           activeSession,
           completionHistory,
+          rsipNodes,
+          rsipMeta,
+          taskTimeStats,
           currentView: activeSession ? 'focus' : 'dashboard',
         }));
 
@@ -276,14 +428,14 @@ function App() {
           await storage.saveScheduledSessions(scheduledSessions);
         }
       } catch (error) {
-        console.error('加载数据失败:', error);
+        console.error('Failed to load data:', error);
       } finally {
         setIsLoadingData(false);
       }
     };
 
     if (isInitialized) {
-      console.log('应用初始化完成，开始加载数据');
+      console.log('Application initialization complete, starting data load');
       loadData();
     } else {
       setIsLoadingData(false);
@@ -332,6 +484,9 @@ function App() {
         );
         
         if (expiredSessions.length > 0) {
+          // Play sound for expired sessions
+          soundManager.playTimerFinished();
+
           // 为每个过期的会话显示失败通知
           expiredSessions.forEach(session => {
             const chain = prev.chains.find(c => c.id === session.chainId);
@@ -355,7 +510,7 @@ function App() {
     return () => clearInterval(interval);
   }, [storage, isInitialized]);
 
-  const handleCreateChain = (parentId?: string) => {
+  const handleCreateChain = () => {
     setState(prev => ({
       ...prev,
       currentView: 'editor',
@@ -363,41 +518,105 @@ function App() {
     }));
   };
 
+  const handleCreateTaskGroup = () => {
+    setState(prev => ({
+      ...prev,
+      currentView: 'taskgroup-editor',
+      editingChain: null,
+    }));
+  };
+
+  // 辅助函数：安全保存链条数据，保持回收箱完整
+  const safelySaveChains = async (updatedActiveChains: Chain[], retryCount: number = 0): Promise<void> => {
+    const maxRetries = 3;
+    try {
+      console.log(`[APP] Starting safe save operation for chains (attempt ${retryCount + 1})...`);
+      
+      // CRITICAL FIX: Get all existing chains (including deleted ones) to avoid overwriting recycle bin data
+      const allExistingChains = await storage.getChains();
+      const deletedChains = allExistingChains.filter(chain => chain.deletedAt != null);
+      
+      // Merge active chains with deleted chains to preserve recycle bin
+      const allUpdatedChains = [...updatedActiveChains, ...deletedChains];
+      
+      // ENHANCED FIX: Use real-time sync service for consistent and reliable saves
+      await realTimeSyncService.saveWithSync(storage, allUpdatedChains);
+      
+      console.log('[APP] Safe save completed successfully with enhanced synchronization');
+    } catch (error) {
+      console.error(`[APP] Safe save failed (attempt ${retryCount + 1}):`, error);
+      
+      // ENHANCED: Implement retry mechanism for transient failures
+      if (retryCount < maxRetries) {
+        const retryDelay = Math.pow(2, retryCount) * 1000; // Exponential backoff
+        console.log(`[APP] Retrying safe save in ${retryDelay}ms...`);
+        
+        // Clear all caches before retry to ensure clean state
+        await realTimeSyncService.clearAllCaches(storage);
+        
+        return new Promise((resolve, reject) => {
+          setTimeout(async () => {
+            try {
+              await safelySaveChains(updatedActiveChains, retryCount + 1);
+              resolve();
+            } catch (retryError) {
+              reject(retryError);
+            }
+          }, retryDelay);
+        });
+      } else {
+        // All retries exhausted, throw the error
+        throw error;
+      }
+    }
+  };
+
   const handleEditChain = (chainId: string) => {
     const chain = state.chains.find(c => c.id === chainId);
     if (chain) {
+      // 区分任务群和普通链条的编辑
+      const isTaskGroup = chain.type === 'group' || chain.isTaskGroup;
       setState(prev => ({
         ...prev,
-        currentView: 'editor',
+        currentView: isTaskGroup ? 'taskgroup-editor' : 'editor',
         editingChain: chain,
       }));
     }
   };
 
-  const handleSaveChain = async (chainData: Omit<Chain, 'id' | 'currentStreak' | 'auxiliaryStreak' | 'totalCompletions' | 'totalFailures' | 'auxiliaryFailures' | 'createdAt' | 'lastCompletedAt'>) => {
-    console.log('开始保存链数据...', chainData);
-    console.log('当前编辑的链:', state.editingChain);
+  const handleSaveChain = async (chainData: Omit<Chain, 'id' | 'currentStreak' | 'auxiliaryStreak' | 'totalCompletions' | 'totalFailures' | 'auxiliaryFailures' | 'createdAt' | 'lastCompletedAt'>, isCopy: boolean = false) => {
+    console.log('Starting to save chain data...', chainData);
+    console.log('Currently editing chain:', state.editingChain);
+    console.log('Is Copy Mode:', isCopy);
     console.log('当前所有链条:', state.chains.map(c => ({ id: c.id, name: c.name })));
     
     try {
-      let updatedChains: Chain[];
+      // CRITICAL FIX: 获取所有链条（包括已删除的）以避免覆盖回收箱数据
+      const allExistingChains = await storage.getChains();
+      console.log('获取到所有现有链条（包括已删除的）:', allExistingChains.length);
       
-      if (state.editingChain) {
+      // 分离活跃链条和已删除链条
+      const activeChains = allExistingChains.filter(chain => chain.deletedAt == null);
+      const deletedChains = allExistingChains.filter(chain => chain.deletedAt != null);
+      console.log('活跃链条数量:', activeChains.length, '已删除链条数量:', deletedChains.length);
+      
+      let updatedActiveChains: Chain[];
+      
+      if (state.editingChain && !isCopy) {
         // Editing existing chain
         console.log('编辑模式 - 原始链条数据:', state.editingChain);
         console.log('新的链条数据:', chainData);
         
-        updatedChains = state.chains.map(chain =>
+        updatedActiveChains = state.chains.map(chain =>
           chain.id === state.editingChain!.id
             ? { ...chain, ...chainData }
             : chain
         );
-        console.log('编辑现有链，更新后的链数组长度:', updatedChains.length);
-        const editedChain = updatedChains.find(c => c.id === state.editingChain!.id);
+        console.log('编辑现有链，更新后的活跃链数组长度:', updatedActiveChains.length);
+        const editedChain = updatedActiveChains.find(c => c.id === state.editingChain!.id);
         console.log('编辑后的链数据:', editedChain);
-        console.log('编辑后所有链条:', updatedChains.map(c => ({ id: c.id, name: c.name })));
       } else {
-        // Creating new chain
+        // Creating new chain (or copying)
         const newChain: Chain = {
           id: crypto.randomUUID(),
           ...chainData,
@@ -408,28 +627,36 @@ function App() {
           auxiliaryFailures: 0,
           createdAt: new Date(),
         };
-        console.log('创建新链:', newChain);
-        updatedChains = [...state.chains, newChain];
-        console.log('添加新链后的链数组长度:', updatedChains.length);
+        if (isCopy) {
+          // If copying, append " (副本)" to name if not already present
+          // But chainData.name comes from the form, which the user might have edited.
+          // So we just use chainData as is.
+          console.log('复制链条:', newChain);
+        } else {
+          console.log('创建新链:', newChain);
+        }
+        updatedActiveChains = [...state.chains, newChain];
+        console.log('添加新链后的活跃链数组长度:', updatedActiveChains.length);
       }
       
-      // 确保所有链都有必需的字段
-      updatedChains = updatedChains.map(chain => ({
+      // 确保所有活跃链都有必需的字段
+      updatedActiveChains = updatedActiveChains.map(chain => ({
         ...chain,
         type: chain.type || 'unit',
         sortOrder: chain.sortOrder || Math.floor(Date.now() / 1000),
         parentId: chain.parentId || undefined,
       }));
       
-      console.log('准备保存到存储...');
-      // Wait for data to be saved before updating UI
-      await storage.saveChains(updatedChains);
-      console.log('数据保存成功，更新UI状态');
+      console.log('准备安全保存到存储（包含回收箱数据）...');
+      // 使用安全保存方法
+      await safelySaveChains(updatedActiveChains);
+      queryOptimizer.onDataChange('chains');
+      console.log('数据保存成功（包含回收箱数据），更新UI状态');
       
-      // Only update state after successful save
+      // Only update state after successful save (only with active chains)
       setState(prev => ({
         ...prev,
-        chains: updatedChains,
+        chains: updatedActiveChains,
         currentView: 'dashboard',
         editingChain: null,
       }));
@@ -442,7 +669,7 @@ function App() {
       
       // 如果保存失败，重新加载数据以确保状态一致性
       try {
-        const currentChains = await storage.getChains();
+        const currentChains = await storage.getActiveChains();
         setState(prev => ({
           ...prev,
           chains: currentChains,
@@ -482,8 +709,9 @@ function App() {
         // Save to storage first
         await Promise.all([
           storage.saveScheduledSessions(updatedSessions),
-          storage.saveChains(updatedChains)
+          safelySaveChains(updatedChains)
         ]);
+        queryOptimizer.onDataChange('chains');
         
         // Update state after successful save
         setState(prev => ({ 
@@ -500,9 +728,39 @@ function App() {
     updateStateAndSave();
   };
 
-  const handleStartChain = (chainId: string) => {
+  const handleStartChain = async (chainId: string) => {
+    // 检查是否启用狂赌模式并且需要押注（仅在配置了Supabase时）
+    if (isSupabaseConfigured && !pendingChainId) { // 防止递归调用
+      try {
+        const isGamblingEnabled = await UserSettingsService.isGamblingModeEnabled();
+        if (isGamblingEnabled) {
+          // 获取链条信息以获得任务持续时间
+          const chain = state.chains.find(c => c.id === chainId);
+          if (!chain) return;
+          
+          // 在数据库中创建真正的会话记录，获取UUID
+          const sessionId = await SessionService.createActiveSession(chainId, chain.duration);
+          
+          // 保存待开始的链条ID和会话ID
+          setPendingChainId(chainId);
+          setCurrentSessionId(sessionId);
+          setShowBettingModal(true);
+          return; // 等待用户完成押注或取消
+        }
+      } catch (error) {
+        console.error('Failed to check gambling mode:', error);
+        // 如果检查失败，继续正常启动任务
+      }
+    }
+
+    // 原有的任务启动逻辑
     const chain = state.chains.find(c => c.id === chainId);
     if (!chain) return;
+
+    // 检查是否存在对该链的预约会话
+    const existingScheduledSession = state.scheduledSessions.find(
+      session => session.chainId === chainId
+    );
 
     // 如果是任务群，检查时间限定
     if (chain.type === 'group') {
@@ -535,16 +793,79 @@ function App() {
         }));
       }
 
-      const chainTree = buildChainTree(state.chains);
+      const chainTree = queryOptimizer.memoizedBuildChainTree(state.chains);
       const groupNode = chainTree.find(node => node.id === chainId);
       if (groupNode) {
         const nextUnit = getNextUnitInGroup(groupNode);
         if (nextUnit) {
-          handleStartChain(nextUnit.id);
+          console.log(`任务群 ${chain.name} 开始下一个任务: ${nextUnit.name}`);
+          await handleStartChain(nextUnit.id);
+          return;
+        } else {
+          // 所有子任务都已完成：增加任务群完成计数并重置子任务进度，然后从头开始
+          console.log(`任务群 ${chain.name} 所有子任务已完成，开始新一轮循环`);
+          
+          const updatedChains = incrementGroupCompletionCount(state.chains, chainId);
+          const updatedGroup = updatedChains.find(c => c.id === chainId);
+          
+          // 显示新轮次开始通知
+          if (updatedGroup) {
+            notificationManager.notifyTaskCompleted(
+              `${updatedGroup.name} (任务群)`, 
+              updatedGroup.totalCompletions, 
+              `第${updatedGroup.totalCompletions}轮已完成，正在开始第${updatedGroup.totalCompletions + 1}轮`
+            );
+          }
+          
+          try {
+            // 首先保存数据并更新状态
+            await safelySaveChains(updatedChains);
+            queryOptimizer.onDataChange('chains');
+            setState(prev => ({ ...prev, chains: updatedChains }));
+            
+            // 等待状态更新后再尝试找到下一个单元
+            setTimeout(async () => {
+              // 使用最新的链数据重新构建树
+              const freshChains = await storage.getActiveChains();
+              const newTree = queryOptimizer.memoizedBuildChainTree(freshChains);
+              const newGroupNode = newTree.find(n => n.id === chainId);
+              
+              console.log(`调试信息 - 群组 ${chain.name}:`, {
+                找到群组节点: !!newGroupNode,
+                子节点数量: newGroupNode?.children.length || 0,
+                子节点详情: newGroupNode?.children.map(child => ({
+                  id: child.id,
+                  name: child.name,
+                  currentStreak: child.currentStreak,
+                  taskRepeatCount: child.taskRepeatCount || 1,
+                  type: child.type
+                })) || []
+              });
+              
+              const firstUnit = newGroupNode ? getNextUnitInGroup(newGroupNode) : null;
+              if (firstUnit) {
+                console.log(`任务群 ${chain.name} 开始新一轮（第${updatedGroup?.totalCompletions + 1}轮），从 ${firstUnit.name} 开始`);
+                await handleStartChain(firstUnit.id);
+              } else {
+                console.log(`任务群 ${chain.name} 没有子任务可执行 - 可能的原因:`, {
+                  群组存在: !!newGroupNode,
+                  子任务数量: newGroupNode?.children.length || 0,
+                  所有子任务都已完成: newGroupNode?.children.every(child => {
+                    const requiredRepeats = child.taskRepeatCount || 1;
+                    return child.currentStreak >= requiredRepeats;
+                  }) || false
+                });
+              }
+            }, 100);
+          } catch (e) {
+            console.error('保存任务群完成计数失败:', e);
+          }
           return;
         }
+      } else {
+        console.error(`无法找到任务群节点: ${chainId}`);
+        return;
       }
-      return;
     }
 
     const activeSession: ActiveSession = {
@@ -555,29 +876,100 @@ function App() {
       totalPausedTime: 0,
     };
 
-    // Remove any scheduled session for this chain
+    // Remove any scheduled session for this chain and update auxiliary streak if there was a booking
     const updatedScheduledSessions = state.scheduledSessions.filter(
       session => session.chainId !== chainId
     );
+
+    // 如果存在预约，增加辅助链记录（相当于自动完成预约）
+    let updatedChains = state.chains;
+    if (existingScheduledSession) {
+      updatedChains = state.chains.map(c =>
+        c.id === chainId
+          ? { ...c, auxiliaryStreak: c.auxiliaryStreak + 1 }
+          : c
+      );
+      
+      // 显示预约完成通知
+      notificationManager.notifyTaskCompleted(`${chain.name} (预约)`, chain.auxiliaryStreak + 1, '预约已完成');
+    }
 
     setState(prev => {
       storage.saveActiveSession(activeSession);
       storage.saveScheduledSessions(updatedScheduledSessions);
       
+      // 如果有预约完成，保存更新的链条数据
+      if (existingScheduledSession) {
+        safelySaveChains(updatedChains).catch(error => {
+      queryOptimizer.onDataChange('chains');
+          console.error('开始任务时保存链条数据失败:', error);
+        });
+      }
+      
       return {
         ...prev,
         activeSession,
         scheduledSessions: updatedScheduledSessions,
+        chains: updatedChains,
         currentView: 'focus',
       };
     });
   };
 
-  const handleCompleteSession = () => {
+  // 处理押注完成后的任务启动
+  const handleBetPlaced = async (betResult: BetPlacementResult) => {
+    console.log('Bet placed successfully:', betResult);
+    
+    if (pendingChainId) {
+      // 保存数据库session ID，用于后续清理
+      setActiveSessionId(currentSessionId);
+      
+      // 押注成功，继续启动任务
+      await handleStartChain(pendingChainId);
+    }
+    
+    // 清理临时状态
+    setPendingChainId(null);
+    setCurrentSessionId(null);
+    setShowBettingModal(false);
+  };
+
+  // 处理押注取消
+  const handleBetCancelled = async () => {
+    // 如果有创建的会话记录，删除它将触发押注退款（通过数据库触发器）
+    if (currentSessionId && isSupabaseConfigured) {
+      try {
+        // 直接删除会话，数据库触发器会自动将押注退款给用户
+        await SessionService.deleteActiveSession(currentSessionId);
+        console.log('已删除取消的会话记录，押注已通过触发器退款:', currentSessionId);
+      } catch (error) {
+        console.error('删除取消的会话记录失败:', error);
+        // 继续清理状态，即使删除失败
+      }
+    }
+    
+    // 清理临时状态，不启动任务
+    setPendingChainId(null);
+    setCurrentSessionId(null);
+    setActiveSessionId(null);
+    setShowBettingModal(false);
+  };
+
+  const handleCompleteSession = (description?: string, notes?: string) => {
     if (!state.activeSession) return;
 
     const chain = state.chains.find(c => c.id === state.activeSession!.chainId);
     if (!chain) return;
+
+    // 计算实际用时
+    let actualDuration = state.activeSession.duration; // 默认使用计划时长
+    
+    if (chain.isDurationless) {
+      // 对于无时长任务，从正向计时器获取实际用时
+      const sessionId = `${state.activeSession.chainId}_${state.activeSession.startedAt.getTime()}`;
+      const elapsedSeconds = forwardTimerManager.stopTimer(sessionId);
+      actualDuration = Math.ceil(elapsedSeconds / 60); // 转换为分钟并向上取整
+    }
 
     // 显示任务完成通知
     const newStreak = chain.currentStreak + 1;
@@ -588,6 +980,10 @@ function App() {
       completedAt: new Date(),
       duration: state.activeSession.duration,
       wasSuccessful: true,
+      actualDuration: actualDuration,
+      isForwardTimed: !!chain.isDurationless,
+      description: description,
+      notes: notes,
     };
 
     setState(prev => {
@@ -602,16 +998,65 @@ function App() {
           : c
       );
       
-      // 如果完成的是单元任务，且该单元属于某个任务群，也要更新任务群的完成次数
+      // 如果完成的是单元任务，且该单元属于某个任务群，检查任务群是否完成
       if (chain.parentId && chain.type !== 'group') {
-        updatedChains = updateGroupCompletions(updatedChains, chain.parentId);
+        // 构建任务树来检查任务群状态
+        const chainTree = queryOptimizer.memoizedBuildChainTree(updatedChains);
+        const groupNode = chainTree.find(node => node.id === chain.parentId);
+        
+        if (groupNode && groupNode.type === 'group') {
+          // 检查任务群中的所有任务是否都已完成其重复次数
+          if (isGroupFullyCompleted(groupNode)) {
+            console.log(`任务群 ${groupNode.name} 已完成所有任务，增加完成计数`);
+            
+            // 增加任务群的完成计数并重置子任务进度
+            updatedChains = incrementGroupCompletionCount(updatedChains, chain.parentId);
+            
+            // 显示任务群完成通知
+            const parentChain = updatedChains.find(c => c.id === chain.parentId);
+            if (parentChain) {
+              notificationManager.notifyTaskCompleted(
+                `${parentChain.name} (任务群)`, 
+                parentChain.currentStreak, 
+                '任务群完成一轮'
+              );
+            }
+          }
+        }
       }
 
       const updatedHistory = [...prev.completionHistory, completionRecord];
       
-      storage.saveChains(updatedChains);
+      // 使用安全保存方法保持回收箱数据完整
+      safelySaveChains(updatedChains).catch(error => {
+      queryOptimizer.onDataChange('chains');
+        console.error('完成任务时保存链条数据失败:', error);
+      });
       storage.saveActiveSession(null);
-      storage.saveCompletionHistory(updatedHistory);
+      
+      // 使用新的完成任务方法来处理押注结算和会话结束
+      if (activeSessionId && isSupabaseConfigured) {
+        SessionService.completeTaskWithBetting(
+          activeSessionId,
+          true, // 任务成功完成
+          '任务完成'
+        ).then((result) => {
+          console.log('任务完成和押注结算成功:', result);
+          setActiveSessionId(null);
+        }).catch(error => {
+          console.error('完成任务和押注结算失败:', error);
+          // 如果新方法失败，仍然保存历史记录作为fallback
+          storage.saveCompletionHistory(updatedHistory);
+        });
+      } else {
+        // 如果没有活动会话或未配置Supabase，直接保存历史记录
+        storage.saveCompletionHistory(updatedHistory);
+      }
+      
+      // 更新用时统计（仅对成功完成的任务）
+      if (completionRecord.actualDuration) {
+        storage.updateTaskTimeStats(chain.id, completionRecord.actualDuration);
+      }
 
       return {
         ...prev,
@@ -629,16 +1074,24 @@ function App() {
     const chain = state.chains.find(c => c.id === state.activeSession!.chainId);
     if (!chain) return;
 
+    // 清理正向计时器（如果是无时长任务）
+    if (chain.isDurationless) {
+      const sessionId = `${state.activeSession.chainId}_${state.activeSession.startedAt.getTime()}`;
+      forwardTimerManager.clearTimer(sessionId);
+    }
+
     const completionRecord: CompletionHistory = {
       chainId: chain.id,
       completedAt: new Date(),
       duration: state.activeSession.duration,
       wasSuccessful: false,
       reasonForFailure: reason || '用户主动中断',
+      actualDuration: state.activeSession.duration, // 中断时使用计划时长
+      isForwardTimed: !!chain.isDurationless,
     };
 
     setState(prev => {
-      const updatedChains = prev.chains.map(c =>
+      let updatedChains = prev.chains.map(c =>
         c.id === chain.id
           ? {
               ...c,
@@ -648,11 +1101,39 @@ function App() {
           : c
       );
 
+      // 如果中断的是单元任务，且该单元属于某个任务群，重置任务群的完成计数
+      if (chain.parentId && chain.type !== 'group') {
+        console.log(`任务 ${chain.name} 失败/中断，重置任务群完成计数`);
+        updatedChains = resetGroupCompletionCount(updatedChains, chain.parentId);
+      }
+
       const updatedHistory = [...prev.completionHistory, completionRecord];
       
-      storage.saveChains(updatedChains);
+      // 使用安全保存方法保持回收箱数据完整
+      safelySaveChains(updatedChains).catch(error => {
+      queryOptimizer.onDataChange('chains');
+        console.error('中断任务时保存链条数据失败:', error);
+      });
       storage.saveActiveSession(null);
-      storage.saveCompletionHistory(updatedHistory);
+      
+      // 使用新的完成任务方法来处理押注结算和会话结束（任务失败）
+      if (activeSessionId && isSupabaseConfigured) {
+        SessionService.completeTaskWithBetting(
+          activeSessionId,
+          false, // 任务失败/中断
+          '任务中断或失败'
+        ).then((result) => {
+          console.log('任务中断/失败和押注结算成功:', result);
+          setActiveSessionId(null);
+        }).catch(error => {
+          console.error('中断任务和押注结算失败:', error);
+          // 如果新方法失败，仍然保存历史记录作为fallback
+          storage.saveCompletionHistory(updatedHistory);
+        });
+      } else {
+        // 如果没有活动会话或未配置Supabase，直接保存历史记录
+        storage.saveCompletionHistory(updatedHistory);
+      }
 
       return {
         ...prev,
@@ -704,7 +1185,7 @@ function App() {
     });
   };
 
-  const handleAuxiliaryJudgmentFailure = (chainId: string, reason: string) => {
+  const handleAuxiliaryJudgmentFailure = (chainId: string) => {
     setState(prev => {
       // Remove the scheduled session
       const updatedScheduledSessions = prev.scheduledSessions.filter(
@@ -721,7 +1202,11 @@ function App() {
           : chain
       );
       
-      storage.saveChains(updatedChains);
+      // 使用安全保存方法保持回收箱数据完整
+      safelySaveChains(updatedChains).catch(error => {
+      queryOptimizer.onDataChange('chains');
+        console.error('辅助判断失败时保存链条数据失败:', error);
+      });
       storage.saveScheduledSessions(updatedScheduledSessions);
       
       return {
@@ -750,7 +1235,11 @@ function App() {
           : chain
       );
       
-      storage.saveChains(updatedChains);
+      // 使用安全保存方法保持回收箱数据完整
+      safelySaveChains(updatedChains).catch(error => {
+      queryOptimizer.onDataChange('chains');
+        console.error('辅助判断允许时保存链条数据失败:', error);
+      });
       storage.saveScheduledSessions(updatedScheduledSessions);
       
       return {
@@ -767,6 +1256,41 @@ function App() {
     setShowAuxiliaryJudgment(chainId);
   };
 
+  const handleCompleteBooking = (chainId: string) => {
+    setState(prev => {
+      // 移除对应的预约会话
+      const updatedScheduledSessions = prev.scheduledSessions.filter(
+        session => session.chainId !== chainId
+      );
+      
+      // 找到对应的链条并增加辅助链记录
+      const updatedChains = prev.chains.map(chain =>
+        chain.id === chainId
+          ? { ...chain, auxiliaryStreak: chain.auxiliaryStreak + 1 }
+          : chain
+      );
+      
+      // 保存更新的数据
+      storage.saveScheduledSessions(updatedScheduledSessions);
+      safelySaveChains(updatedChains).catch(error => {
+      queryOptimizer.onDataChange('chains');
+        console.error('完成预约时保存链条数据失败:', error);
+      });
+      
+      return {
+        ...prev,
+        scheduledSessions: updatedScheduledSessions,
+        chains: updatedChains
+      };
+    });
+    
+    // 显示完成通知
+    const chain = state.chains.find(c => c.id === chainId);
+    if (chain) {
+      notificationManager.notifyTaskCompleted(`${chain.name} (预约)`, chain.auxiliaryStreak + 1, '预约已完成');
+    }
+  };
+
   const handleAddException = (exceptionRule: string) => {
     if (!state.activeSession) return;
 
@@ -780,7 +1304,11 @@ function App() {
           : chain
       );
       
-      storage.saveChains(updatedChains);
+      // 使用安全保存方法保持回收箱数据完整
+      safelySaveChains(updatedChains).catch(error => {
+      queryOptimizer.onDataChange('chains');
+        console.error('添加异常时保存链条数据失败:', error);
+      });
       
       return {
         ...prev,
@@ -811,66 +1339,312 @@ function App() {
     }));
   };
 
-  const handleDeleteChain = (chainId: string) => {
-    setState(prev => {
-      // Remove the chain
-      const updatedChains = prev.chains.filter(chain => chain.id !== chainId);
+  const handleDeleteChain = async (chainId: string) => {
+    try {
+      console.log(`[APP] Starting delete operation for chain: ${chainId}`);
       
-      // Remove any scheduled sessions for this chain
-      const updatedScheduledSessions = prev.scheduledSessions.filter(
-        session => session.chainId !== chainId
-      );
+      // ENHANCED: Use real-time sync service for immediate and reliable updates
+      const updatedChains = await realTimeSyncService.deleteWithSync(storage, chainId);
       
-      // Remove completion history for this chain
-      const updatedHistory = prev.completionHistory.filter(
-        history => history.chainId !== chainId
-      );
+      // CRITICAL FIX: Update state immediately with fresh data
+      setState(prev => {
+        // Remove any scheduled sessions for this chain
+        const updatedScheduledSessions = prev.scheduledSessions.filter(
+          session => session.chainId !== chainId
+        );
+        
+        // If currently active session belongs to this chain, clear it
+        const updatedActiveSession = prev.activeSession?.chainId === chainId 
+          ? null 
+          : prev.activeSession;
+        
+        // Save updated sessions to storage
+        storage.saveScheduledSessions(updatedScheduledSessions);
+        if (!updatedActiveSession) {
+          storage.saveActiveSession(null);
+        }
+        
+        return {
+          ...prev,
+          chains: updatedChains,
+          scheduledSessions: updatedScheduledSessions,
+          activeSession: updatedActiveSession,
+          currentView: updatedActiveSession ? prev.currentView : 'dashboard',
+          viewingChainId: prev.viewingChainId === chainId ? null : prev.viewingChainId,
+        };
+      });
       
-      // If currently active session belongs to this chain, clear it
-      const updatedActiveSession = prev.activeSession?.chainId === chainId 
-        ? null 
-        : prev.activeSession;
+      // CRITICAL FIX: Trigger RecycleBin refresh immediately after delete
+      setRecycleBinRefreshTrigger(prev => prev + 1);
       
-      // Save to storage
-      storage.saveChains(updatedChains);
-      storage.saveScheduledSessions(updatedScheduledSessions);
-      storage.saveCompletionHistory(updatedHistory);
-      if (!updatedActiveSession) {
-        storage.saveActiveSession(null);
+      // ENHANCED FIX: Force RecycleBin state refresh with multiple layers of cache clearing
+      try {
+        console.log('[APP] Forcing comprehensive RecycleBin state refresh after delete...');
+        
+        // Layer 1: Clear all application-level caches
+        await realTimeSyncService.clearAllCaches(storage);
+        
+        // Layer 2: Force refresh of RecycleBin data to ensure it's updated
+        await storage.getDeletedChains();
+        
+        // Layer 3: Additional state sync to ensure UI consistency
+        setTimeout(() => {
+          setState(prev => ({
+            ...prev,
+            chains: [...prev.chains] // Force array reference update
+          }));
+        }, 50);
+        
+        console.log('[APP] RecycleBin state refresh completed successfully');
+      } catch (refreshError) {
+        console.warn('[APP] RecycleBin state refresh warning (delete operation still successful):', refreshError);
+        // Don't throw error since delete operation succeeded
       }
       
-      return {
-        ...prev,
-        chains: updatedChains,
-        scheduledSessions: updatedScheduledSessions,
-        completionHistory: updatedHistory,
-        activeSession: updatedActiveSession,
-        currentView: updatedActiveSession ? prev.currentView : 'dashboard',
-        viewingChainId: prev.viewingChainId === chainId ? null : prev.viewingChainId,
-      };
-    });
+      console.log(`[APP] Chain ${chainId} successfully moved to recycle bin with full state synchronization`);
+    } catch (error) {
+      console.error('[APP] Delete operation failed:', error);
+      
+      // ENHANCED: Provide better error messaging
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+      
+      // Show user-friendly error message
+      alert(`删除失败: ${errorMessage}\n\n请检查网络连接并重试。如果问题持续，请刷新页面。`);
+      
+      // ENHANCED: Attempt to recover by reloading current state
+      try {
+        console.log('[APP] Attempting state recovery after delete failure...');
+        const currentChains = await storage.getActiveChains();
+        setState(prev => ({
+          ...prev,
+          chains: currentChains,
+        }));
+        console.log('[APP] State recovery completed');
+      } catch (recoveryError) {
+        console.error('[APP] State recovery also failed:', recoveryError);
+        alert('发生错误后无法恢复状态，建议刷新页面。');
+      }
+    }
   };
 
-  const handleImportChains = async (importedChains: Chain[]) => {
-    console.log('开始导入链数据...', importedChains);
+  const handleRestoreChains = async (chainIds: string[]) => {
+    console.log('[APP] Starting restore operation for chains:', chainIds);
     
     try {
-      // 合并导入的链条到现有链条中
-      const updatedChains = [...state.chains, ...importedChains];
+      // ENHANCED: Use real-time sync service for immediate and reliable updates
+      console.log('[APP] Calling realTimeSyncService.restoreWithSync...');
+      const updatedChains = await realTimeSyncService.restoreWithSync(storage, chainIds);
       
-      console.log('准备保存导入的数据到存储...');
-      // Wait for data to be saved before updating UI
-      await storage.saveChains(updatedChains);
-      console.log('导入数据保存成功，更新UI状态');
+      console.log('[APP] Restore operation completed, updating UI state immediately...');
       
-      // Only update state after successful save
+      // CRITICAL FIX: Force immediate state update to ensure UI reflects changes without refresh
+      setState(prev => {
+        const newState = {
+          ...prev,
+          chains: updatedChains,
+        };
+        console.log('[APP] State updated with', updatedChains.length, 'chains');
+        return newState;
+      });
+      
+      // ENHANCED: Force a complete refresh to ensure consistency
+      console.log('[APP] Forcing complete data refresh after restore...');
+      await realTimeSyncService.forceRefresh();
+      
+      // ADDITIONAL: Reload data to ensure absolute consistency
+      setTimeout(async () => {
+        try {
+          const latestChains = await storage.getActiveChains();
+          setState(prev => ({
+            ...prev,
+            chains: latestChains,
+          }));
+          console.log('[APP] Final state verification completed with', latestChains.length, 'chains');
+        } catch (verificationError) {
+          console.warn('[APP] State verification failed:', verificationError);
+        }
+      }, 100);
+      
+      console.log(`[APP] Successfully restored ${chainIds.length} chains, UI state updated immediately`);
+      
+      // CRITICAL FIX: 恢复后立即刷新回收箱状态，确保数据同步
+      try {
+        console.log('正在刷新回收箱状态以确保恢复操作后的数据同步...');
+        
+        // 预获取已删除链条以刷新缓存状态
+        await storage.getDeletedChains();
+        
+        console.log('恢复操作后的回收箱状态刷新完成');
+      } catch (refreshError) {
+        console.warn('恢复操作后刷新回收箱状态时出现警告（不影响恢复操作）:', refreshError);
+        // 不抛出错误，因为恢复操作本身已成功
+      }
+    } catch (error) {
+      console.error('[APP] Restore operation failed:', error);
+      
+      // ENHANCED: Provide more detailed error information
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+      
+      // ENHANCED: Better error handling with partial failure support
+      if (errorMessage.includes('Partial restore failure') || errorMessage.includes('failed to restore')) {
+        // Handle partial failures more gracefully
+        console.warn('[APP] Some chains may have been restored despite errors, refreshing state...');
+        
+        try {
+          const currentChains = await storage.getActiveChains();
+          setState(prev => ({
+            ...prev,
+            chains: currentChains,
+          }));
+          
+          alert('部分链条恢复可能失败，请检查回收箱确认结果。如果问题持续，请刷新页面。');
+        } catch (refreshError) {
+          console.error('[APP] Failed to refresh state after partial restore failure:', refreshError);
+          alert('恢复操作遇到问题，请刷新页面查看最新状态。');
+        }
+      } else {
+        // Complete failure
+        alert(`恢复失败: ${errorMessage}\n\n如果问题持续，请刷新页面重试。`);
+      }
+    }
+  };
+
+  const handlePermanentDeleteChains = async (chainIds: string[]) => {
+    try {
+      console.log('永久删除链条:', chainIds);
+      
+      // ENHANCED: Use real-time sync service for immediate and reliable updates
+      const updatedChains = await realTimeSyncService.permanentDeleteWithSync(storage, chainIds);
+      
+      // ADDITIONAL FIX: Explicitly update state to ensure UI reflects changes immediately
       setState(prev => ({
         ...prev,
         chains: updatedChains,
       }));
+      
+      // CRITICAL FIX: 永久删除后立即刷新回收箱状态，确保数据同步
+      try {
+        console.log('正在刷新回收箱状态以确保永久删除操作后的数据同步...');
+        
+        // 强制清除查询缓存
+        queryOptimizer.clearCache();
+        
+        // 如果存储支持清除缓存，也执行清除
+        if (storage.clearCache && typeof storage.clearCache === 'function') {
+          storage.clearCache();
+        }
+        
+        // 预获取已删除链条以刷新缓存状态
+        await storage.getDeletedChains();
+        
+        console.log('永久删除操作后的回收箱状态刷新完成');
+      } catch (refreshError) {
+        console.warn('永久删除操作后刷新回收箱状态时出现警告（不影响删除操作）:', refreshError);
+        // 不抛出错误，因为删除操作本身已成功
+      }
+      
+      console.log(`成功永久删除 ${chainIds.length} 条链条，UI状态已更新`);
+    } catch (error) {
+      console.error('永久删除链条失败:', error);
+      alert('永久删除失败，请重试');
+    }
+  };
+
+  const handleImportChains = async (importedChains: Chain[], options?: { 
+    history?: CompletionHistory[];
+    rsipNodes?: RSIPNode[];
+    rsipMeta?: RSIPMeta;
+    exceptionRules?: any[];
+  }) => {
+    console.log('开始导入数据...', { chains: importedChains.length, options });
+    
+    try {
+      // CRITICAL FIX: Additional authentication check as a safety net
+      console.log('Double-checking authentication state before import operations...');
+      const isAuth = await isUserAuthenticated();
+      
+      if (!isAuth) {
+        console.log('Authentication not ready, waiting...');
+        const { user, isAuthenticated } = await waitForAuthentication(10000);
+        
+        if (!isAuthenticated || !user) {
+          throw new Error('Authentication failed during import. Please ensure you are logged in and try again.');
+        }
+        
+        console.log('Authentication confirmed after wait. User ID:', user.id);
+      }
+      
+      console.log('准备保存导入的数据到存储...');
+      
+      // 验证导入的链条数据
+      if (!Array.isArray(importedChains) || importedChains.length === 0) {
+        throw new Error('没有有效的链条数据可导入');
+      }
+      
+      // 获取当前最新的链条数据（避免使用可能过期的state.chains）
+      const currentChains = await storage.getChains();
+      console.log('当前数据库中的链条数量:', currentChains.length);
+      console.log('准备导入的链条数量:', importedChains.length);
+      
+      // 检查ID冲突（双重保险）
+      const existingIds = new Set(currentChains.map(c => c.id));
+      const conflictingChains = importedChains.filter(c => existingIds.has(c.id));
+      if (conflictingChains.length > 0) {
+        console.error('发现ID冲突的链条:', conflictingChains.map(c => c.id));
+        throw new Error(`导入失败：发现${conflictingChains.length}个ID冲突的链条`);
+      }
+      
+      // 创建合并后的链条列表（但只保存导入的部分）
+      const updatedChains = [...currentChains, ...importedChains];
+      
+      // 仅保存合并后的完整链条列表（让saveChains处理用户权限）
+      await safelySaveChains(updatedChains);
+      queryOptimizer.onDataChange('chains');
+      
+      // 获取导入的其他数据
+      const importedHistory = options?.history || [];
+      const importedRsipNodes = options?.rsipNodes || [];
+      const importedRsipMeta = options?.rsipMeta;
+      
+      // 保存完成历史
+      if (Array.isArray(importedHistory) && importedHistory.length > 0) {
+        const existing = await storage.getCompletionHistory();
+        const merged = [...existing, ...importedHistory];
+        await storage.saveCompletionHistory(merged);
+      }
+      
+      // 保存 RSIP 节点数据
+      if (Array.isArray(importedRsipNodes) && importedRsipNodes.length > 0) {
+        const existingNodes = await storage.getRSIPNodes();
+        const mergedNodes = [...existingNodes, ...importedRsipNodes];
+        await storage.saveRSIPNodes(mergedNodes);
+      }
+      
+      // 保存 RSIP 元数据
+      if (importedRsipMeta) {
+        const existingMeta = await storage.getRSIPMeta();
+        const mergedMeta = { ...existingMeta, ...importedRsipMeta };
+        await storage.saveRSIPMeta(mergedMeta);
+      }
+      
+      console.log('导入数据保存成功，更新UI状态');
+      
+      // 更新状态
+      setState(prev => ({
+        ...prev,
+        chains: updatedChains,
+        completionHistory: Array.isArray(importedHistory) && importedHistory.length > 0
+          ? [...prev.completionHistory, ...importedHistory]
+          : prev.completionHistory,
+        rsipNodes: Array.isArray(importedRsipNodes) && importedRsipNodes.length > 0
+          ? [...prev.rsipNodes, ...importedRsipNodes]
+          : prev.rsipNodes,
+        rsipMeta: importedRsipMeta ? { ...prev.rsipMeta, ...importedRsipMeta } : prev.rsipMeta,
+      }));
+      
       console.log('导入完成，UI状态更新完成');
     } catch (error) {
-      console.error('Failed to import chains:', error);
+      console.error('Failed to import data:', error);
       // 提供更详细的错误信息
       const errorMessage = error instanceof Error ? error.message : '未知错误';
       alert(`导入失败: ${errorMessage}\n\n请查看控制台了解详细信息，然后重试`);
@@ -878,9 +1652,13 @@ function App() {
       // 如果导入失败，重新加载数据以确保状态一致性
       try {
         const currentChains = await storage.getChains();
+        const currentRsipNodes = await storage.getRSIPNodes();
+        const currentRsipMeta = await storage.getRSIPMeta();
         setState(prev => ({
           ...prev,
           chains: currentChains,
+          rsipNodes: currentRsipNodes,
+          rsipMeta: currentRsipMeta,
         }));
       } catch (reloadError) {
         console.error('重新加载数据也失败了:', reloadError);
@@ -929,8 +1707,9 @@ function App() {
       }
       
       console.log('准备保存导入后的数据到存储...');
-      // Wait for data to be saved before updating UI
-      await storage.saveChains(updatedChains);
+      // Wait for data to be saved before updating UI - 使用安全保存方法
+      await safelySaveChains(updatedChains);
+      queryOptimizer.onDataChange('chains');
       console.log('导入数据保存成功，更新UI状态');
       
       // Only update state after successful save
@@ -958,7 +1737,66 @@ function App() {
     }
   };
 
-  return renderContent();
+  const handleUpdateTaskRepeatCount = async (chainId: string, repeatCount: number) => {
+    console.log('开始更新任务重复次数...', { chainId, repeatCount });
+    
+    try {
+      // 找到要更新的链条
+      const updatedChains = state.chains.map(chain => {
+        if (chain.id === chainId) {
+          return { ...chain, taskRepeatCount: repeatCount };
+        }
+        return chain;
+      });
+
+      console.log('准备保存重复次数更新到存储...');
+      // Wait for data to be saved before updating UI - 使用安全保存方法
+      await safelySaveChains(updatedChains);
+      queryOptimizer.onDataChange('chains');
+      console.log('重复次数更新保存成功，更新UI状态');
+
+      // Only update state after successful save
+      setState(prev => ({
+        ...prev,
+        chains: updatedChains,
+      }));
+      console.log('重复次数更新完成，UI状态更新完成');
+    } catch (error) {
+      console.error('Failed to update task repeat count:', error);
+      // 提供更详细的错误信息
+      const errorMessage = error instanceof Error ? error.message : '未知错误';
+      alert(`重复次数更新失败: ${errorMessage}\n\n请查看控制台了解详细信息，然后重试`);
+      
+      // 如果更新失败，重新加载数据以确保状态一致性
+      try {
+        const currentChains = await storage.getChains();
+        setState(prev => ({
+          ...prev,
+          chains: currentChains,
+        }));
+      } catch (reloadError) {
+        console.error('重新加载数据也失败了:', reloadError);
+      }
+    }
+  };
+
+  return (
+    <>
+      {renderContent()}
+      
+      {/* Betting Modal */}
+      {showBettingModal && pendingChainId && currentSessionId && (
+        <BettingModal
+          isOpen={showBettingModal}
+          onClose={handleBetCancelled}
+          onBetPlaced={handleBetPlaced}
+          sessionId={currentSessionId}
+          chainName={state.chains.find(c => c.id === pendingChainId)?.name || 'Unknown Task'}
+          taskDuration={state.chains.find(c => c.id === pendingChainId)?.duration || 0}
+        />
+      )}
+    </>
+  );
 }
 
 export default App;

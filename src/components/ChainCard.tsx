@@ -1,9 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Chain, ScheduledSession, ChainTreeNode } from '../types';
 import { Play, Clock } from 'lucide-react';
-import { formatTime, getTimeRemaining, formatDuration } from '../utils/time';
+import { formatTime, getTimeRemaining, formatDuration, formatTimeDescription } from '../utils/time';
 import { getChainTypeConfig } from '../utils/chainTree';
 import { notificationManager } from '../utils/notifications';
+import { storage } from '../utils/storage';
+import { soundManager } from '../utils/soundManager';
 
 interface ChainCardProps {
   chain: Chain | ChainTreeNode;
@@ -12,30 +14,44 @@ interface ChainCardProps {
   onScheduleChain: (chainId: string) => void;
   onViewDetail: (chainId: string) => void;
   onCancelScheduledSession?: (chainId: string) => void;
+  onCompleteBooking?: (chainId: string) => void;
   onDelete: (chainId: string) => void;
 }
 
-export const ChainCard: React.FC<ChainCardProps> = ({
+// Performance optimized ChainCard component with React.memo
+export const ChainCard: React.FC<ChainCardProps> = React.memo(({
   chain,
   scheduledSession,
   onStartChain,
   onScheduleChain,
   onViewDetail,
   onCancelScheduledSession,
+  onCompleteBooking,
   onDelete,
 }) => {
   const [timeRemaining, setTimeRemaining] = useState<number>(0);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
   const [hasShownWarning, setHasShownWarning] = useState(false);
+  const [lastCompletionTime, setLastCompletionTime] = useState<number | null>(null);
+  const lastPlayedExpiresAtRef = React.useRef<number | null>(null);
   
-  // 获取实际的链条数据，确保显示最新的时长信息
-  const actualChain = React.useMemo(() => {
+  // 获取实际的链条数据，确保显示最新的时长信息 - memoized for performance
+  const actualChain = useMemo(() => {
     // 如果传入的是 ChainTreeNode，需要确保数据是最新的
     return chain;
   }, [chain]);
 
-  const typeConfig = getChainTypeConfig(chain.type);
+  // Memoize type configuration to prevent recalculation
+  const typeConfig = useMemo(() => getChainTypeConfig(chain.type), [chain.type]);
+
+  // 获取上次完成时间（仅对无时长任务）
+  useEffect(() => {
+    if (chain.isDurationless || chain.duration === 0) {
+      const lastTime = storage.getLastCompletionTime(chain.id);
+      setLastCompletionTime(lastTime);
+    }
+  }, [chain.id, chain.isDurationless, chain.duration]);
 
   // 计算通知时机
   const getNotificationThreshold = (durationMinutes: number) => {
@@ -44,7 +60,10 @@ export const ChainCard: React.FC<ChainCardProps> = ({
     return Math.min(thresholdMinutes, 1) * 60; // 转换为秒，最多1分钟
   };
   useEffect(() => {
-    if (!scheduledSession) return;
+    if (!scheduledSession) {
+      lastPlayedExpiresAtRef.current = null;
+      return;
+    }
 
     const notificationThreshold = getNotificationThreshold(chain.auxiliaryDuration);
 
@@ -65,6 +84,12 @@ export const ChainCard: React.FC<ChainCardProps> = ({
       if (remaining <= 0) {
         // 预约失败通知
         notificationManager.notifyScheduleFailed(chain.name);
+        
+        // Play sound when timer reaches 0, but only once per session
+        if (lastPlayedExpiresAtRef.current !== scheduledSession.expiresAt.getTime()) {
+          soundManager.playTimerFinished();
+          lastPlayedExpiresAtRef.current = scheduledSession.expiresAt.getTime();
+        }
       }
     };
 
@@ -177,7 +202,15 @@ export const ChainCard: React.FC<ChainCardProps> = ({
         <div className="flex items-center justify-between mb-6 p-3 rounded-xl bg-gray-50 dark:bg-slate-700/50">
           <div className="flex items-center space-x-2 text-gray-700 dark:text-slate-300">
             <Clock size={16} />
-            <span className="font-medium">{formatTime(actualChain.duration)}</span>
+            <span className="font-medium">
+              {(actualChain.isDurationless || actualChain.duration === 0) 
+                ? (lastCompletionTime 
+                    ? `上次：${formatTimeDescription(lastCompletionTime)}`
+                    : '首次执行'
+                  )
+                : formatTime(actualChain.duration)
+              }
+            </span>
           </div>
           <div className="text-gray-600 dark:text-slate-400 text-sm font-mono">
             {actualChain.totalCompletions} completion{(actualChain.totalCompletions === 0 || actualChain.totalCompletions === 1) ? '' : 's'}
@@ -199,16 +232,28 @@ export const ChainCard: React.FC<ChainCardProps> = ({
             <div className="text-blue-600 dark:text-blue-400 text-xs mb-3 font-chinese">
               请在时间结束前完成: {chain.auxiliaryCompletionTrigger}
             </div>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onCancelScheduledSession?.(chain.id);
-              }}
-              className="w-full bg-red-500/10 hover:bg-red-500/20 dark:bg-red-500/20 dark:hover:bg-red-500/30 text-red-600 dark:text-red-400 px-3 py-3 rounded-xl text-sm transition-colors duration-200 flex items-center justify-center space-x-2 border border-red-200/50 dark:border-red-400/30"
-            >
-              <i className="fas fa-exclamation-triangle"></i>
-              <span className="font-chinese font-medium">中断/规则判定</span>
-            </button>
+            <div className="flex space-x-2">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onCompleteBooking?.(chain.id);
+                }}
+                className="flex-1 bg-green-500/10 hover:bg-green-500/20 dark:bg-green-500/20 dark:hover:bg-green-500/30 text-green-600 dark:text-green-400 px-3 py-3 rounded-xl text-sm transition-colors duration-200 flex items-center justify-center space-x-2 border border-green-200/50 dark:border-green-400/30"
+              >
+                <i className="fas fa-check"></i>
+                <span className="font-chinese font-medium">完成预约</span>
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onCancelScheduledSession?.(chain.id);
+                }}
+                className="flex-1 bg-red-500/10 hover:bg-red-500/20 dark:bg-red-500/20 dark:hover:bg-red-500/30 text-red-600 dark:text-red-400 px-3 py-3 rounded-xl text-sm transition-colors duration-200 flex items-center justify-center space-x-2 border border-red-200/50 dark:border-red-400/30"
+              >
+                <i className="fas fa-exclamation-triangle"></i>
+                <span className="font-chinese font-medium">中断/规则判定</span>
+              </button>
+            </div>
           </div>
         )}
 
@@ -324,4 +369,7 @@ export const ChainCard: React.FC<ChainCardProps> = ({
       )}
     </div>
   );
-};
+});
+
+// Add display name for better debugging
+ChainCard.displayName = 'ChainCard';
